@@ -165,10 +165,21 @@ without a token, uploads honour a free-space floor and an optional
 a non-2xx, never a silent "delivered"). Reviewed iteratively — most recently a
 full multi-perspective code + security audit (2026-07-07).
 
-## Ideas / TODO
+## Roadmap
 
-- Push prebuilt image to a registry (ghcr) for real CasaOS portability
-- Encrypted backup between boxes over the tailnet (restic/borg)
+Both original roadmap items are now shipped:
+
+- **Prebuilt image on a registry (GHCR)** — a signed, multi-arch
+  (`amd64`/`arm64`) image publishes to `ghcr.io/chicohaager/dropbridge` on every
+  version tag, with a keyless cosign signature, SLSA build provenance and an
+  SBOM. CasaOS / Compose can `image:`-pull it instead of building — see
+  [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml).
+- **Encrypted backup between boxes over the tailnet** — a nightly `restic` job
+  (03:00) ships an encrypted (AES-256), deduplicated, incremental snapshot to a
+  second ZimaOS node across the tailnet. It runs alongside DropBridge on the box
+  (a companion cron task, not part of the container):
+
+![Nightly encrypted restic backup — successful snapshot](docs/backup-restic.png)
 
 ## About
 
