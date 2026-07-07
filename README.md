@@ -43,6 +43,14 @@ mkdir -p /DATA/dropbridge/incoming
 docker compose up -d --build
 ```
 
+**Prefer the prebuilt image?** Skip the build and pull the signed multi-arch image
+(`amd64`/`arm64`) from GHCR with the ready-made [`docker-compose.ghcr.yml`](docker-compose.ghcr.yml):
+
+```bash
+docker pull ghcr.io/chicohaager/dropbridge:0.2.0
+docker compose -f docker-compose.ghcr.yml up -d
+```
+
 UI: `http://<box-tailnet-ip>:8787/`. For HTTPS, put it behind `tailscale serve`
 on a path (so it can coexist with the ZimaOS WebUI on `/`):
 

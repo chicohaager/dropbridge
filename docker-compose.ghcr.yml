@@ -1,0 +1,89 @@
+# DropBridge — CasaOS / Docker Compose that PULLS the prebuilt, signed image
+# (multi-arch amd64+arm64) instead of building from source. Import this in the
+# CasaOS app store, or run it directly:
+#
+#   # create the shared bearer token next to this file first:
+#   umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 48 > secret.token
+#   chown 1000:1000 secret.token && chmod 0400 secret.token
+#   cp .env.example .env    # then edit node/peer
+#   docker compose -f docker-compose.ghcr.yml up -d
+#
+# (The plain docker-compose.yml builds from source instead — use that for dev.)
+name: dropbridge
+services:
+  dropbridge:
+    image: ghcr.io/chicohaager/dropbridge:0.2.0
+    container_name: dropbridge
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - DROPBRIDGE_INCOMING=/data/incoming
+      # Token is NOT an env var — read from a file-based secret so it never
+      # appears in `docker inspect` / the process environment. See secret.token.
+      - DROPBRIDGE_TOKEN_FILE=/run/secrets/dropbridge_token
+    secrets:
+      - dropbridge_token
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8787/api/config"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    # HOST networking (not a docker bridge): the guard trusts a caller by its real
+    # 100.x tailnet source IP or a `tailscale serve` header. A bridge can rewrite
+    # the source to the gateway (esp. when Tailscale runs as a container, e.g. the
+    # ZimaOS App-Store) → /api/mesh returns "tailnet identity required" → demo mode.
+    # Host networking exposes 8787 on the host and preserves the real client IP.
+    network_mode: host
+    volumes:
+      - type: bind
+        source: /DATA/dropbridge/incoming
+        target: /data/incoming
+      # tailscaled LocalAPI socket — REQUIRED for presence (whois), node identity
+      # and peer online-state. Without it presence stays "0 online".
+      # If Tailscale is the ZimaOS App-Store app (a container), expose its socket to
+      # the host first: add a bind mount /var/run/tailscale -> /run/tailscale to the
+      # Tailscale app and recreate it.
+      - type: bind
+        source: /var/run/tailscale
+        target: /var/run/tailscale
+        read_only: true
+    labels:
+      icon: "https://raw.githubusercontent.com/chicohaager/dropbridge/main/static/icon.svg"
+    x-casaos:
+      ports:
+        - container: "8787"
+          description:
+            en_us: DropBridge web UI + peer ingest.
+      volumes:
+        - container: /data/incoming
+          description:
+            en_us: Received files land here (/DATA/dropbridge/incoming).
+secrets:
+  # The shared bearer token. Create secret.token next to this file (0400,
+  # owned by the container user uid 1000) — the SAME value on both boxes:
+  #   umask 077; printf %s '<token>' > secret.token; chown 1000:1000 secret.token
+  dropbridge_token:
+    file: ./secret.token
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: dropbridge
+  author: Holger Kuehn - Virtual Services
+  developer: chicohaager
+  category: Networking
+  description:
+    en_us: Drag-and-drop web UI that streams files straight to your other machine over the tailnet — no size or one-shot limits, folders keep their structure. Runs on any Linux; first-class on ZimaOS/CasaOS.
+  tagline:
+    en_us: Drop files, they appear on the other box.
+  title:
+    en_us: DropBridge
+  icon: "https://raw.githubusercontent.com/chicohaager/dropbridge/main/static/icon.svg"
+  index: /
+  is_uncontrolled: false
+  # Tile launch: ZimaOS health-gate probes port_map as a REAL host socket, so it
+  # MUST be the published container port (8787/http). http://<node>:8787 loads
+  # over the tailnet fine.
+  scheme: http
+  port_map: "8787"
