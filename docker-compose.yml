@@ -1,0 +1,56 @@
+name: dropbridge
+services:
+  dropbridge:
+    build: .
+    image: dropbridge:latest
+    container_name: dropbridge
+    restart: unless-stopped
+    # HOST networking (not a docker bridge): the control-plane guard trusts a
+    # caller by its real 100.x tailnet source IP (or a `tailscale serve` header).
+    # A bridge can rewrite the source to the bridge gateway — especially when
+    # Tailscale itself runs as a container (ZimaOS App-Store) — making /api/mesh
+    # answer "tailnet identity required" → the UI drops to demo mode. Host
+    # networking exposes 8787 on the host and lets the container see the real
+    # client IP, whether tailscaled runs on the host or in a container.
+    network_mode: host
+    environment:
+      # Identity + where this node sends to. Set per box (see .env.example).
+      - DROPBRIDGE_NODE=${DROPBRIDGE_NODE:-this-node}
+      - DROPBRIDGE_PEER_NAME=${DROPBRIDGE_PEER_NAME:-peer}
+      - DROPBRIDGE_PEER_URL=${DROPBRIDGE_PEER_URL:-}
+      - DROPBRIDGE_TOKEN=${DROPBRIDGE_TOKEN:-}
+      # Public funnel origin for /s share links + optional ntfy — without the
+      # FUNNEL_BASE passthrough, funnelBase stays empty and shares fall back to
+      # non-public relative /s/ URLs.
+      - DROPBRIDGE_FUNNEL_BASE=${DROPBRIDGE_FUNNEL_BASE:-}
+      - DROPBRIDGE_NTFY_URL=${DROPBRIDGE_NTFY_URL:-}
+      - DROPBRIDGE_INCOMING=/data/incoming
+    volumes:
+      - type: bind
+        source: /DATA/dropbridge/incoming
+        target: /data/incoming
+      # tailscaled LocalAPI socket — REQUIRED for presence (whois), node
+      # identity, peer online-state and TS version. Without it every LocalAPI
+      # call fails ("no such file or directory") and presence stays "0 online".
+      - type: bind
+        source: /var/run/tailscale
+        target: /var/run/tailscale
+        read_only: true
+
+x-casaos:
+  architectures:
+    - amd64
+    - arm64
+  main: dropbridge
+  author: Holger Kuehn - Virtual Services
+  category: Networking
+  description:
+    en_us: A drag-and-drop web UI that streams files straight to your other ZimaOS box over the tailnet — no size or one-shot limits.
+  developer: chicohaager
+  icon: ""
+  tagline:
+    en_us: Drop files, they appear on the other box.
+  title:
+    en_us: DropBridge
+  index: /
+  port_map: "8787"

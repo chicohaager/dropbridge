@@ -1,0 +1,48 @@
+# Secrets — NEVER commit
+.env
+secret.token
+*.token
+TOKEN.txt
+env.*
+!.env.example
+/*.txt
+dist/TOKEN.local
+dist/env.local*
+Pushover.txt
+pushover.conf
+*.secret
+*.hujson
+
+# The whole dist/ tree is build output + ops drafts + secrets (TOKEN.txt, env.*,
+# tailscale-acl.hujson, reply/forum drafts, demo media, testpack tarballs) — the
+# canonical source lives at the repo root, so nothing under dist/ is published.
+/dist/
+
+# Build artifacts
+/dropbridge
+/dist/dropbridge
+
+# Backups created during ops (mv-not-rm convention)
+*.bak-*
+*.retired-*
+backups/
+
+# OS / editor cruft
+.DS_Store
+*.swp
+
+# test package build artifacts
+*.tar.gz
+dist/dropbridge-testpack-*/
+dist/testpack-*/
+
+# Internal ops/design docs — contain real node names/IPs/locations
+FEATURE-MATRIX.md
+/design/
+
+# AI assistant context — never publish
+CLAUDE.md
+AGENTS.md
+.claude/
+.cursorrules
+*.mdc
