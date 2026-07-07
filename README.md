@@ -5,11 +5,26 @@ ZimaOS box over the tailnet**. Unlike Taildrop it has no one-shot / size quirks:
 files are streamed peer-to-peer, conflicts are auto-renamed, and everything lands
 in a `/DATA` folder on the receiving box.
 
-![DropBridge — live mesh console and machine-to-machine transfer](docs/teaser.gif)
+[![DropBridge — live mesh console and machine-to-machine transfer](docs/teaser.gif)](https://www.youtube.com/watch?v=1Qy5gYrb8q4)
 
 *Self-hosted, tailnet-native file transfer between your own machines. No cloud, no
 size limits — runs on **any Linux box with Docker + Tailscale**, first-class on
 ZimaOS / CasaOS (dashboard tile + data-disk picker).*
+
+### ▶ Watch the 2-minute demo
+
+[**DropBridge — self-hosted file transfer across your Tailscale network**](https://www.youtube.com/watch?v=1Qy5gYrb8q4)
+— a full tour of the live mesh console, a machine-to-machine transfer, the storage
+picker, and public one-click share links.
+
+| | |
+|---|---|
+| `0:00` | Intro |
+| `0:16` | Live mesh console (presence, telemetry, latency) |
+| `0:43` | Drag-and-drop, machine-to-machine transfer |
+| `1:01` | Storage picker & public share links |
+| `1:27` | Activity feed & adding nodes |
+| `1:44` | Security model & wrap-up |
 
 ```
  ┌─ browser ─┐   drop    ┌── DropBridge (box A) ──┐   HTTPS/tailnet   ┌── DropBridge (box B) ──┐
