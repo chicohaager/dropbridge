@@ -52,6 +52,24 @@ on both. `DROPBRIDGE_PEER_URL` is the *other* node's tailnet IP:
 
 ## Run
 
+**ZimaOS / CasaOS — recommended:** run [`install.sh`](install.sh). It pulls the
+prebuilt image, generates the token, prepares your data disks, and registers a
+**fixed-URL dashboard tile** (a LinkApp pointing at this node's own tailnet name),
+so the tile opens the live UI **no matter how you reach the dashboard** — LAN IP or
+tailnet name:
+
+```bash
+sudo sh install.sh
+```
+
+> Why a LinkApp: a normal CasaOS store tile builds its launch URL from the *access
+> host*, so opening the dashboard over the LAN IP makes the tile open the LAN origin
+> → the tailnet-only guard 403s → the UI shows demo mode. A LinkApp URL is fixed.
+> Trade-off: the container is not app-managed (no health tile); it stays boot-safe
+> via `restart: unless-stopped`.
+
+**Manual / other Linux:**
+
 ```bash
 export DOCKER_CONFIG=/DATA/.docker         # ZimaOS: docker config is on the RO root
 mkdir -p /DATA/dropbridge/incoming
@@ -65,6 +83,11 @@ docker compose up -d --build
 docker pull ghcr.io/chicohaager/dropbridge:0.2.0
 docker compose -f docker-compose.ghcr.yml up -d
 ```
+
+> The `docker-compose.ghcr.yml` / `docker-compose.yml` paths register a normal CasaOS
+> **store tile** (built from the access host) — open the dashboard via the box's
+> **tailnet name** so the tile opens the tailnet origin. `install.sh` avoids this
+> gotcha with the fixed-URL LinkApp above.
 
 UI: `http://<box-tailnet-ip>:8787/`. For HTTPS, put it behind `tailscale serve`
 on a path (so it can coexist with the ZimaOS WebUI on `/`):
