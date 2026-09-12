@@ -74,6 +74,19 @@ type tsStatus struct {
 	Self         *tsPeer
 	Peer         map[string]*tsPeer
 }
+
+// peerByIP finds the status entry that owns a tailnet IP (nil if none).
+func (st *tsStatus) peerByIP(ip string) *tsPeer {
+	for _, p := range st.Peer {
+		for _, pip := range p.TailscaleIPs {
+			if pip == ip {
+				return p
+			}
+		}
+	}
+	return nil
+}
+
 type tsWhois struct {
 	UserProfile *struct {
 		LoginName   string
@@ -88,11 +101,6 @@ type tsPing struct {
 
 // ---- presence: who has touched this box recently ----
 
-type seen struct {
-	login string
-	at    time.Time
-}
-
 type whoisEntry struct {
 	login string // "" = resolved-to-nothing (negative), cached with a short TTL
 	at    time.Time
@@ -105,7 +113,7 @@ const (
 
 var (
 	presMu        sync.Mutex
-	presence      = map[string]seen{}       // login -> last seen
+	presence      = map[string]time.Time{}  // login -> last seen
 	whoisMemo     = map[string]whoisEntry{} // ip -> resolved login (positive OR negative)
 	whoisInflight = map[string]bool{}       // ip -> a whois goroutine is already running
 )
@@ -124,8 +132,8 @@ func recordPresence(r *http.Request) {
 		stampPresence(login)
 		return
 	}
-	ip, _, _ := net.SplitHostPort(r.RemoteAddr)
-	if ip == "" || strings.HasPrefix(ip, "127.") || ip == "::1" {
+	ip := remoteHost(r)
+	if isLoopback(ip) {
 		return // local/serve-proxied without header — nothing to attribute
 	}
 	if !isTailnetIP(ip) {
@@ -153,7 +161,7 @@ func recordPresence(r *http.Request) {
 
 func stampPresence(login string) {
 	presMu.Lock()
-	presence[login] = seen{login: login, at: time.Now()}
+	presence[login] = time.Now()
 	presMu.Unlock()
 }
 
@@ -223,11 +231,11 @@ func activeUsers(window time.Duration) []string {
 	presMu.Lock()
 	defer presMu.Unlock()
 	out := []string{}
-	for l, s := range presence {
-		if time.Since(s.at) <= window {
-			out = append(out, l)
+	for login, at := range presence {
+		if time.Since(at) <= window {
+			out = append(out, login)
 		} else {
-			delete(presence, l)
+			delete(presence, login)
 		}
 	}
 	return out
@@ -264,7 +272,9 @@ func diskFreeTotal(path string) (free, total int64) {
 		log.Printf("statfs %s failed: %v", path, err) // loud: a real disk shouldn't read as 0/0
 		return 0, 0
 	}
-	return int64(st.Bavail) * int64(st.Bsize), int64(st.Blocks) * int64(st.Bsize)
+	// statfs counts blocks in f_frsize units (what df uses); f_bsize is only the
+	// preferred I/O size and can differ on some filesystems.
+	return int64(st.Bavail) * int64(st.Frsize), int64(st.Blocks) * int64(st.Frsize)
 }
 
 // firstV4 returns a node's Tailscale CGNAT IPv4 (100.64.0.0/10). Peers carry both
@@ -305,48 +315,42 @@ type meshNode struct {
 	Self      bool     `json:"self,omitempty"`
 }
 
-// selfNode assembles this box's real telemetry.
-func selfNode() meshNode {
+// selfNode assembles this box's real telemetry. st is the caller's LocalAPI
+// status snapshot (nil when tailscaled was unreachable → env-name fallback).
+func selfNode(st *tsStatus) meshNode {
 	free, total := diskFreeTotal(incomingDir)
 	n := meshNode{
 		ID: nodeName, Role: env("DROPBRIDGE_ROLE", ""), Online: true, Self: true,
 		OS: env("DROPBRIDGE_OS", "ZimaOS"), Kernel: firstLine("/proc/sys/kernel/osrelease"),
 		Uptime: uptimeStr(), FreeBytes: free, TotBytes: total, Users: activeUsers(5 * time.Minute),
 	}
-	var st tsStatus
-	if err := tsGet("status", &st); err == nil && st.Self != nil {
+	if st != nil && st.Self != nil {
 		n.ID = shortName(st.Self.DNSName)
-		if ip := firstV4(st.Self.TailscaleIPs); ip != "" {
-			n.TailnetIP = ip
-		}
+		n.TailnetIP = firstV4(st.Self.TailscaleIPs)
 		n.Tailscale = strings.SplitN(st.Version, "-", 2)[0]
-	}
-	if n.Users == nil {
-		n.Users = []string{}
 	}
 	return n
 }
 
 func handleMesh(w http.ResponseWriter, r *http.Request) {
-	self := selfNode()
-	out := map[string]any{"self": self, "generated": time.Now().Unix()}
+	// ONE LocalAPI status snapshot per poll, shared by self + every peer.
+	var st tsStatus
+	stp := &st
+	out := map[string]any{"generated": time.Now().Unix(), "tailscaled": true}
+	if err := tsGet("status", &st); err != nil {
+		// Surface a dead local tailnet daemon instead of silently showing a
+		// healthy-looking mesh (peers then fall back to HTTP-only probing).
+		out["tailscaled"] = false
+		out["tailscaleError"] = err.Error()
+		stp = nil
+	}
+	out["self"] = selfNode(stp)
 
 	cfgs := snapshotPeers()
 	if r.URL.Query().Get("bare") == "1" || len(cfgs) == 0 {
 		out["peers"] = []meshNode{}
 		writeJSON(w, out)
 		return
-	}
-
-	// one LocalAPI status snapshot, shared across all peers (online + DNS name).
-	var st tsStatus
-	if err := tsGet("status", &st); err != nil {
-		// Surface a dead local tailnet daemon instead of silently showing a
-		// healthy-looking mesh (peers then fall back to HTTP-only probing).
-		out["tailscaled"] = false
-		out["tailscaleError"] = err.Error()
-	} else {
-		out["tailscaled"] = true
 	}
 
 	// enrich every configured peer concurrently so /api/mesh stays snappy even
@@ -373,14 +377,10 @@ func enrichPeer(c peerCfg, st *tsStatus) meshNode {
 		peer.ID = c.ID
 	}
 	// online + real DNS name from LocalAPI status
-	for _, p := range st.Peer {
-		for _, ip := range p.TailscaleIPs {
-			if ip == c.ID {
-				peer.Online = p.Online
-				if n := shortName(p.DNSName); n != "" {
-					peer.ID = n
-				}
-			}
+	if p := st.peerByIP(c.ID); p != nil {
+		peer.Online = p.Online
+		if n := shortName(p.DNSName); n != "" {
+			peer.ID = n
 		}
 	}
 	// latency: prefer the LocalAPI disco ping (pure RTT); DERP-only links return
@@ -452,15 +452,4 @@ func fetchPeerBare(url string) *meshNode {
 		return nil
 	}
 	return &body.Self
-}
-
-func hostFromURL(u string) string {
-	u = strings.TrimPrefix(strings.TrimPrefix(u, "http://"), "https://")
-	if i := strings.IndexByte(u, '/'); i >= 0 {
-		u = u[:i]
-	}
-	if h, _, err := net.SplitHostPort(u); err == nil {
-		return h
-	}
-	return u
 }

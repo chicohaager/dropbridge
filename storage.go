@@ -14,6 +14,8 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -36,22 +38,49 @@ type settings struct {
 	Incoming string `json:"incoming"`
 }
 
-func settingsFile() string { return filepath.Join(stateDir, ".dropbridge-settings.json") }
+var settingsFile = filepath.Join(stateDir, ".dropbridge-settings.json")
 
 func loadSettings() (s settings) {
-	if b, err := os.ReadFile(settingsFile()); err == nil {
-		json.Unmarshal(b, &s)
+	if _, err := readJSONFile(settingsFile, &s); err != nil {
+		log.Printf("loadSettings: %v — using disk scan / env fallback", err)
 	}
 	return
 }
 
-func saveSettings(s settings) error {
-	b, _ := json.MarshalIndent(s, "", "  ")
-	tmp := settingsFile() + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
+func saveSettings(s settings) error { return writeJSONAtomic(settingsFile, s) }
+
+// readJSONFile loads a JSON state file. found=false (nil error) when the file
+// simply doesn't exist yet; any other read or parse failure is returned so the
+// caller can decide NOT to persist over a recoverable file.
+func readJSONFile(p string, v any) (found bool, err error) {
+	b, err := os.ReadFile(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
 	}
-	return os.Rename(tmp, settingsFile())
+	if err != nil {
+		return false, fmt.Errorf("cannot read %s: %w", p, err)
+	}
+	if err := json.Unmarshal(b, v); err != nil {
+		return true, fmt.Errorf("%s is corrupt: %w", p, err)
+	}
+	return true, nil
+}
+
+// writeJSONAtomic persists v as indented JSON via tmp-file + rename, so a crash
+// mid-write can never leave a truncated state file behind.
+func writeJSONAtomic(p string, v any) error {
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal %s: %w", p, err)
+	}
+	tmp := p + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		return fmt.Errorf("rename %s: %w", p, err)
+	}
+	return nil
 }
 
 // storageDisk is one candidate data disk under /media.
@@ -151,7 +180,9 @@ func resolveIncoming() string {
 	}
 	for _, d := range scanDisks() {
 		if d.Prepared && ensureIncoming(d.Path) {
-			saveSettings(settings{Incoming: d.Path})
+			if err := saveSettings(settings{Incoming: d.Path}); err != nil {
+				log.Printf("resolveIncoming: %v — choice will be re-derived on next start", err)
+			}
 			return d.Path
 		}
 	}

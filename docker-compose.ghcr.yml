@@ -21,6 +21,7 @@ services:
       # Token is NOT an env var — read from a file-based secret so it never
       # appears in `docker inspect` / the process environment. See secret.token.
       - DROPBRIDGE_TOKEN_FILE=/run/secrets/dropbridge_token
+      - DROPBRIDGE_STATE=/state
     secrets:
       - dropbridge_token
     healthcheck:
@@ -48,6 +49,18 @@ services:
         source: /var/run/tailscale
         target: /var/run/tailscale
         read_only: true
+      # Peers / shares / storage choice live in /state (NOT in the incoming dir, so
+      # the received-files folder can be repointed without losing mesh config).
+      # Without this bind they vanish on every recreate. chown 1000:1000 it first.
+      - type: bind
+        source: /DATA/AppData/dropbridge/state
+        target: /state
+      # Data disks for the storage picker (ZimaOS mounts them under /media). The
+      # non-root app can only receive into a "<disk>/DropBridge" dir that a root
+      # setup step created and chowned — install.sh does that.
+      - type: bind
+        source: /media
+        target: /media
     labels:
       icon: "https://raw.githubusercontent.com/chicohaager/dropbridge/main/static/icon.svg"
     x-casaos:
@@ -58,7 +71,10 @@ services:
       volumes:
         - container: /data/incoming
           description:
-            en_us: Received files land here (/DATA/dropbridge/incoming).
+            en_us: Received files land here (/DATA/dropbridge/incoming) unless a data disk is picked in the UI.
+        - container: /state
+          description:
+            en_us: Peers, share links and the storage choice (/DATA/AppData/dropbridge/state).
 secrets:
   # The shared bearer token. Create secret.token next to this file (0400,
   # owned by the container user uid 1000) — the SAME value on both boxes:
