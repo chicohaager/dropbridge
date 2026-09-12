@@ -72,7 +72,8 @@ sudo sh install.sh
 
 ```bash
 export DOCKER_CONFIG=/DATA/.docker         # ZimaOS: docker config is on the RO root
-mkdir -p /DATA/dropbridge/incoming
+mkdir -p /DATA/dropbridge/incoming /DATA/AppData/dropbridge/state
+chown 1000:1000 /DATA/dropbridge/incoming /DATA/AppData/dropbridge/state   # container app user
 docker compose up -d --build
 ```
 
@@ -89,7 +90,12 @@ docker compose -f docker-compose.ghcr.yml up -d
 > **tailnet name** so the tile opens the tailnet origin. `install.sh` avoids this
 > gotcha with the fixed-URL LinkApp above.
 
-UI: `http://<box-tailnet-ip>:8787/`. For HTTPS, put it behind `tailscale serve`
+UI: `http://<box-tailnet-ip>:8787/`. The console uses the **ZFW Firewall**
+light design system by default (cream page, white cards, forest-green accent,
+Fira Sans / Fira Code when installed — no webfont download); **theme** in the
+header switches to the dark console look, remembered per browser.
+
+For HTTPS, put it behind `tailscale serve`
 on a path (so it can coexist with the ZimaOS WebUI on `/`):
 
 ```bash
@@ -119,8 +125,10 @@ devices (via tailscaled) and adds one as a send target. A target must run
 DropBridge with the **same token** — adding probes its `/api/config` and refuses
 anything that isn't DropBridge (with a clear message), so you can't add a phone
 or a plain host by mistake. The peer list persists to `.dropbridge-peers.json`
-in the incoming volume; the first entry is the default target and is seeded from
-`DROPBRIDGE_PEER_URL` for back-compat. The drop zone's target selector lists
+in the **state dir** (`/state` in the container — bind it to
+`/DATA/AppData/dropbridge/state`, as the shipped compose files and `install.sh`
+do, or it is lost on recreate); the first entry is the default target and is
+seeded from `DROPBRIDGE_PEER_URL` for back-compat. The drop zone's target selector lists
 *this box* + every peer; remove a node from its detail panel.
 
 ## Public share links (funnel)
@@ -140,7 +148,17 @@ sudo tailscale funnel --bg --https=10000 --set-path /s http://127.0.0.1:8787/s
 
 and set `DROPBRIDGE_FUNNEL_BASE` to that origin (above). Funnel must be enabled
 for the tailnet in the admin console. Share metadata persists to
-`.dropbridge-shares.json` inside the incoming volume (survives recreate).
+`.dropbridge-shares.json` in the same state dir as the peer list (survives
+recreate as long as `/state` is bind-mounted).
+
+## Received-files folder (storage picker)
+
+Where received files land is chosen at runtime: **storage** in the header lists
+the data disks under `/media` (eMMC, pseudo and fuse/cloud mounts excluded). A
+disk is selectable once a root setup step has created and chowned
+`<disk>/DropBridge` for the container user — `install.sh` does that for every
+native (ext4/xfs/btrfs) disk. The choice persists in the state dir; with no
+prepared disk the app falls back to `DROPBRIDGE_INCOMING` (`/data/incoming`).
 
 ## Why no firewall change is needed
 
@@ -163,6 +181,7 @@ ZFW rule if you want to reach the UI from a plain-LAN device.
 | `GET` | `/s/{token}` | **public** (funnel): serves the one shared file |
 | `GET` | `/api/tailnet` | tailnet devices (from tailscaled) as add-candidates |
 | `GET` | `/api/peers` · `POST` `/api/peers` · `POST` `/api/peers/remove` | list / add / remove DropBridge send targets |
+| `GET` | `/api/storage` · `POST` `/api/storage` | list candidate data disks / repoint the received-files folder (restarts) |
 
 ## Status
 
@@ -185,8 +204,12 @@ internal `.dropbridge-*` metadata can't be shared/served/deleted; share tokens a
 128-bit `crypto/rand`; the bearer compare is timing-safe. Ingest is fail-closed
 without a token, uploads honour a free-space floor and an optional
 `DROPBRIDGE_MAX_BYTES` cap, and errors surface loudly (a failed transfer returns
-a non-2xx, never a silent "delivered"). Reviewed iteratively — most recently a
-full multi-perspective code + security audit (2026-07-07).
+a non-2xx, never a silent "delivered"). Reviewed iteratively — a full
+multi-perspective code + security audit (2026-07-07) and a follow-up code,
+security and dedup pass (2026-09-12) that added the unit tests: `go test ./...`
+covers path sanitising, the shared received-file resolver, conflict renames,
+reserved metadata names, the serve-header spoof guard, and the state-file
+round-trip.
 
 ## Roadmap
 

@@ -4,20 +4,15 @@
 // is exposed to the public internet (tailscale funnel is mounted path-scoped to
 // /s → http://127.0.0.1:8787/s); the rest of the app stays tailnet-only. So a
 // share hands out exactly one file to someone who is NOT on the tailnet, and
-// nothing else is reachable. Shares persist to a dotfile in the incoming dir so
-// they survive container recreputs; they are revocable and optionally expire.
+// nothing else is reachable. Shares persist to a dotfile in stateDir so they
+// survive container recreates; they are revocable and optionally expire.
 package main
 
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
-	"errors"
-	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -52,19 +47,12 @@ var (
 )
 
 func loadShares() {
-	b, err := os.ReadFile(sharesFile)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			// A real read error (EACCES/EIO) is NOT "no shares yet" — surface it and
-			// disable persistence so the next save can't overwrite the file with [].
-			log.Printf("loadShares: cannot read %s: %v — persistence DISABLED (won't clobber)", sharesFile, err)
-			sharesLoadOK = false
-		}
-		return // ErrNotExist → genuinely no shares yet, fine
-	}
 	var list []*share
-	if err := json.Unmarshal(b, &list); err != nil {
-		log.Printf("loadShares: %s is corrupt (%v) — shares NOT loaded, persistence DISABLED", sharesFile, err)
+	if _, err := readJSONFile(sharesFile, &list); err != nil {
+		// A real read/parse error (EACCES/EIO/corrupt) is NOT "no shares yet" —
+		// surface it and disable persistence so the next save can't overwrite the
+		// file with [].
+		log.Printf("loadShares: %v — shares NOT loaded, persistence DISABLED (won't clobber)", err)
 		sharesLoadOK = false
 		return
 	}
@@ -101,19 +89,8 @@ func sharesPersister() {
 			list = append(list, &cp)
 		}
 		sharesMu.Unlock()
-
-		b, err := json.MarshalIndent(list, "", "  ")
-		if err != nil {
-			log.Printf("saveShares: marshal failed: %v", err)
-			continue
-		}
-		tmp := sharesFile + ".tmp"
-		if err := os.WriteFile(tmp, b, 0o600); err != nil {
-			log.Printf("saveShares: write %s failed: %v", tmp, err)
-			continue
-		}
-		if err := os.Rename(tmp, sharesFile); err != nil {
-			log.Printf("saveShares: rename failed: %v", err)
+		if err := writeJSONAtomic(sharesFile, list); err != nil {
+			log.Printf("saveShares: %v", err)
 		}
 	}
 }
@@ -160,15 +137,10 @@ func view(s *share) publicView {
 // POST /api/share?name=<rel>&ttl=<secs>  (tailnet-only) → create/return a share.
 // Reuses an existing live share for the same file so repeated clicks are stable.
 func handleShareCreate(w http.ResponseWriter, r *http.Request) {
-	rel := safeRel(r.URL.Query().Get("name"))
-	if rel == "" {
-		httpErr(w, http.StatusBadRequest, "missing/invalid name")
-		return
-	}
-	full := filepath.Join(incomingDir, filepath.FromSlash(rel))
-	if info, err := os.Stat(full); err != nil || info.IsDir() || isInternal(full) {
-		// isInternal: refuse to mint a PUBLIC funnel link for our own metadata
-		// dotfiles — that would publish every share token to the open internet.
+	// receivedFile also refuses our metadata dotfiles: minting a PUBLIC funnel
+	// link for those would publish every share token to the open internet.
+	rel, _, ok := receivedFile(r.URL.Query().Get("name"))
+	if !ok {
 		httpErr(w, http.StatusNotFound, "file not found")
 		return
 	}
@@ -179,33 +151,44 @@ func handleShareCreate(w http.ResponseWriter, r *http.Request) {
 			ttl = 0
 		}
 	}
-
-	sharesMu.Lock()
-	defer sharesMu.Unlock()
-	// reuse a still-valid share for this exact file
-	for _, s := range shares {
-		if s.Name == rel && !s.expired() {
-			if ttl > 0 { // refresh expiry to the newly requested window
-				s.Expires = time.Now().Unix() + ttl
-				saveShares()
-			}
-			writeJSON(w, view(s))
-			return
-		}
-	}
+	// Token generation happens before the lock: crypto/rand can block, and a
+	// spare token on the reuse path costs nothing.
 	tok, err := newToken()
 	if err != nil {
 		httpErr(w, http.StatusInternalServerError, "token gen failed: "+err.Error())
 		return
 	}
-	s := &share{Token: tok, Name: rel, Created: time.Now().Unix()}
-	if ttl > 0 {
-		s.Expires = time.Now().Unix() + ttl
+	now := time.Now().Unix()
+
+	// Build the response under the lock, but WRITE it after unlocking — a slow
+	// client must not stall every other share op (incl. public /s/ downloads).
+	sharesMu.Lock()
+	var out publicView
+	created := false
+	for _, s := range shares { // reuse a still-valid share for this exact file
+		if s.Name == rel && !s.expired() {
+			if ttl > 0 { // refresh expiry to the newly requested window
+				s.Expires = now + ttl
+				saveShares()
+			}
+			out = view(s)
+			break
+		}
 	}
-	shares[tok] = s
-	saveShares()
-	log.Printf("shared %q → %s", rel, s.url())
-	writeJSON(w, view(s))
+	if out.share == nil {
+		s := &share{Token: tok, Name: rel, Created: now}
+		if ttl > 0 {
+			s.Expires = now + ttl
+		}
+		shares[tok] = s
+		saveShares()
+		out, created = view(s), true
+	}
+	sharesMu.Unlock()
+	if created {
+		log.Printf("shared %q → %s", rel, out.URL)
+	}
+	writeJSON(w, out)
 }
 
 // GET /api/shares  (tailnet-only) → all live shares, keyed for UI lookup.
@@ -251,7 +234,7 @@ func handleUnshare(w http.ResponseWriter, r *http.Request) {
 // shared file. Unknown/expired token → generic 404 (no enumeration leak).
 func handlePublicShare(w http.ResponseWriter, r *http.Request) {
 	tok := strings.TrimPrefix(r.URL.Path, "/s/")
-	if tok == "" || strings.ContainsAny(tok, "/.") {
+	if !validToken(tok) {
 		http.NotFound(w, r)
 		return
 	}
@@ -271,16 +254,12 @@ func handlePublicShare(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	// defence in depth: re-sanitize the stored path before touching disk.
-	rel := safeRel(name)
-	if rel == "" {
+	// defence in depth: re-resolve the stored path (re-sanitized, must still be a
+	// regular non-internal file) before touching disk — it may have been deleted
+	// after sharing.
+	rel, full, ok := receivedFile(name)
+	if !ok {
 		http.NotFound(w, r)
-		return
-	}
-	full := filepath.Join(incomingDir, filepath.FromSlash(rel))
-	info, err := os.Stat(full)
-	if err != nil || info.IsDir() || isInternal(full) {
-		http.NotFound(w, r) // deleted after sharing, or an internal metadata file
 		return
 	}
 	// Count only downloads we actually serve — not 404 probes — so a flood of bad
@@ -291,6 +270,19 @@ func handlePublicShare(w http.ResponseWriter, r *http.Request) {
 		saveShares()
 	}
 	sharesMu.Unlock()
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", path.Base(rel)))
-	http.ServeFile(w, r, full)
+	serveAttachment(w, r, rel, full)
+}
+
+// validToken accepts exactly the shape newToken mints: 32 lowercase hex chars.
+// Anything else 404s before a map lookup — no path games, no enumeration hints.
+func validToken(tok string) bool {
+	if len(tok) != 32 {
+		return false
+	}
+	for i := 0; i < len(tok); i++ {
+		if c := tok[i]; (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return false
+		}
+	}
+	return true
 }

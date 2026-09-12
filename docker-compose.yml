@@ -25,10 +25,22 @@ services:
       - DROPBRIDGE_FUNNEL_BASE=${DROPBRIDGE_FUNNEL_BASE:-}
       - DROPBRIDGE_NTFY_URL=${DROPBRIDGE_NTFY_URL:-}
       - DROPBRIDGE_INCOMING=/data/incoming
+      - DROPBRIDGE_STATE=/state
     volumes:
       - type: bind
         source: /DATA/dropbridge/incoming
         target: /data/incoming
+      # Peers / shares / storage choice live in /state (NOT in the incoming dir, so
+      # the received-files folder can be repointed without losing mesh config).
+      # Without this bind they vanish on every `up --force-recreate`.
+      # Create it writable for the container user first: chown 1000:1000 <dir>
+      - type: bind
+        source: /DATA/AppData/dropbridge/state
+        target: /state
+      # Data disks for the storage picker (ZimaOS mounts them under /media).
+      - type: bind
+        source: /media
+        target: /media
       # tailscaled LocalAPI socket — REQUIRED for presence (whois), node
       # identity, peer online-state and TS version. Without it every LocalAPI
       # call fails ("no such file or directory") and presence stays "0 online".

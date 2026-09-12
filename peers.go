@@ -4,9 +4,10 @@
 // SAME bearer token — nothing else can receive a stream, so "add node" probes
 // the candidate's /api/config and refuses anything that isn't DropBridge.
 //
-// The ordered peer list persists to a dotfile in the incoming volume (survives
-// recreate). peersList[0] is the default send target, so the old single-peer
-// behaviour is just "one entry in the list", seeded from DROPBRIDGE_PEER_URL.
+// The ordered peer list persists to a dotfile in stateDir (survives recreate
+// when /state is bind-mounted). peersList[0] is the default send target, so the
+// old single-peer behaviour is just "one entry in the list", seeded from
+// DROPBRIDGE_PEER_URL.
 package main
 
 import (
@@ -17,16 +18,14 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 )
 
 var errNotDropBridge = errors.New("no DropBridge /api/config response")
-
-func errStatus(code int) error { return fmt.Errorf("HTTP %d", code) }
 
 type peerCfg struct {
 	ID    string `json:"id"`   // tailnet IP — stable key
@@ -45,34 +44,28 @@ var (
 )
 
 func loadPeers() {
-	b, err := os.ReadFile(peersFile)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			// A real read error is NOT "no peers yet": disable persistence and don't
-			// seed/save, so we can't overwrite an unreadable peers file.
-			log.Printf("loadPeers: cannot read %s: %v — persistence DISABLED (won't clobber)", peersFile, err)
-			peersLoadOK = false
-			return
-		}
-		// ErrNotExist → genuinely no peers yet; fall through to back-compat seed.
-	} else {
-		var list []peerCfg
-		if err := json.Unmarshal(b, &list); err != nil {
-			log.Printf("loadPeers: %s is corrupt (%v) — peers NOT loaded, persistence DISABLED", peersFile, err)
-			peersLoadOK = false
-			return
-		}
-		peersMu.Lock()
-		peersList = list
-		peersMu.Unlock()
+	var list []peerCfg
+	if _, err := readJSONFile(peersFile, &list); err != nil {
+		// A real read/parse error is NOT "no peers yet": disable persistence and
+		// don't seed/save, so we can't overwrite a recoverable peers file.
+		log.Printf("loadPeers: %v — peers NOT loaded, persistence DISABLED (won't clobber)", err)
+		peersLoadOK = false
+		return
 	}
-	// back-compat: seed from the single-peer env if the list is still empty.
 	peersMu.Lock()
+	defer peersMu.Unlock()
+	peersList = list
+	// back-compat: seed from the single-peer env if the list is still empty. Parse
+	// with net/url — the same parser net/http dials with (see handlePeerAdd).
 	if len(peersList) == 0 && peerURL != "" {
-		peersList = []peerCfg{{ID: hostFromURL(peerURL), Name: orNone(peerName), URL: peerURL, Added: time.Now().Unix()}}
+		u, err := url.Parse(peerURL)
+		if err != nil || u.Hostname() == "" {
+			log.Printf("loadPeers: DROPBRIDGE_PEER_URL %q is not a valid URL — ignored", peerURL)
+			return
+		}
+		peersList = []peerCfg{{ID: u.Hostname(), Name: peerName, URL: peerURL, Added: time.Now().Unix()}}
 		savePeersLocked()
 	}
-	peersMu.Unlock()
 }
 
 // savePeersLocked persists atomically. Caller holds peersMu.
@@ -80,18 +73,8 @@ func savePeersLocked() {
 	if !peersLoadOK {
 		return // never overwrite a peers file we failed to read
 	}
-	b, err := json.MarshalIndent(peersList, "", "  ")
-	if err != nil {
-		log.Printf("savePeersLocked: marshal failed: %v", err)
-		return
-	}
-	tmp := peersFile + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		log.Printf("savePeersLocked: write %s failed: %v", tmp, err)
-		return
-	}
-	if err := os.Rename(tmp, peersFile); err != nil {
-		log.Printf("savePeersLocked: rename failed: %v", err)
+	if err := writeJSONAtomic(peersFile, peersList); err != nil {
+		log.Printf("savePeersLocked: %v", err)
 	}
 }
 
@@ -236,14 +219,13 @@ func handlePeerRemove(w http.ResponseWriter, r *http.Request) {
 // probeDropBridge hits <url>/api/config and returns the remote node name if it
 // looks like DropBridge; error otherwise.
 func probeDropBridge(url string) (string, error) {
-	c := &http.Client{Timeout: 3 * time.Second}
-	resp, err := c.Get(url + "/api/config")
+	resp, err := peerHTTP.Get(url + "/api/config")
 	if err != nil {
 		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", errStatus(resp.StatusCode)
+		return "", fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 	var cfg struct {
 		Node           string `json:"node"`
@@ -298,5 +280,13 @@ func handleTailnet(w http.ResponseWriter, r *http.Request) {
 			Online: p.Online, Added: added[ip], Self: ip == selfIP,
 		})
 	}
+	// st.Peer is a map → random order per call; sort so the picker doesn't
+	// reshuffle every time it opens (online first, then by name).
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Online != out[j].Online {
+			return out[i].Online
+		}
+		return out[i].Name < out[j].Name
+	})
 	writeJSON(w, map[string]any{"devices": out})
 }

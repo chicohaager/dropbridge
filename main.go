@@ -82,8 +82,10 @@ func fileEnv(k, def string) string {
 }
 
 func main() {
-	os.MkdirAll(stateDir, 0o755)
-	incomingDir = resolveIncoming() // persisted choice → largest prepared disk → fallback
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		log.Printf("WARNING: cannot create state dir %s: %v — peers/shares/settings will NOT persist", stateDir, err)
+	}
+	incomingDir = filepath.Clean(resolveIncoming()) // persisted choice → largest prepared disk → fallback
 	if err := os.MkdirAll(incomingDir, 0o755); err != nil {
 		log.Fatalf("cannot create incoming dir %s: %v", incomingDir, err)
 	}
@@ -123,7 +125,7 @@ func main() {
 		// Needed by the loopback healthcheck AND tailnet peer-probe, so it can't be
 		// fully guard()ed — but don't leak node/peer names to a LAN client on the
 		// host-exposed port. Allow loopback OR a tailnet-trusted caller only.
-		if ip := net.ParseIP(remoteHost(r)); !(ip != nil && ip.IsLoopback()) && !authTailnet(r) {
+		if !isLoopback(remoteHost(r)) && !authTailnet(r) {
 			httpErr(w, http.StatusForbidden, "tailnet identity required")
 			return
 		}
@@ -219,8 +221,8 @@ func handleSend(w http.ResponseWriter, r *http.Request) {
 	// the browser can't mistake a dropped/failed transfer for "Delivered ✓":
 	//   all failed → 502, some failed → 207 (partial), all ok → 200.
 	ok := 0
-	for _, r := range results {
-		if r.OK {
+	for _, res := range results {
+		if res.OK {
 			ok++
 		}
 	}
@@ -250,6 +252,10 @@ func resolveTarget(tgt string) string {
 	return ""
 }
 
+// sendHTTP streams files to peers. One shared client (connection pool) — the
+// generous timeout bounds a single stuck transfer, not normal big-file streaming.
+var sendHTTP = &http.Client{Timeout: 6 * time.Hour}
+
 func streamToPeer(rel string, body io.Reader, dest string) error {
 	req, err := http.NewRequest(http.MethodPost, dest+"/api/ingest", body)
 	if err != nil {
@@ -260,8 +266,7 @@ func streamToPeer(rel string, body io.Reader, dest string) error {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	client := &http.Client{Timeout: 6 * time.Hour}
-	resp, err := client.Do(req)
+	resp, err := sendHTTP.Do(req)
 	if err != nil {
 		return err
 	}
@@ -311,6 +316,11 @@ func storeLocal(rel string, body io.Reader) (stored string, n int64, err error) 
 		return "", 0, fmt.Errorf("insufficient disk space: only %s free", humanBytes(free))
 	}
 	full := filepath.Join(incomingDir, filepath.FromSlash(rel))
+	// A file named like our metadata dotfiles would be stored but then hidden from
+	// list/download/delete by isInternal — an invisible, undeletable upload. Refuse.
+	if isInternal(full) {
+		return "", 0, fmt.Errorf("reserved filename: %s", path.Base(rel))
+	}
 	if err = os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return "", 0, fmt.Errorf("mkdir: %w", err)
 	}
@@ -382,31 +392,45 @@ func handleReceived(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"items": items})
 }
 
-func handleDownload(w http.ResponseWriter, r *http.Request) {
-	rel := safeRel(r.URL.Query().Get("name"))
+// receivedFile resolves a client-supplied name to a servable regular file inside
+// incomingDir. ok=false for anything else: unsafe path, missing, a directory,
+// a non-regular file (FIFO/device/symlink target), or our own metadata dotfiles.
+// Every route that touches a received file (download, delete, share, /s/) goes
+// through here so the checks can't drift apart.
+func receivedFile(name string) (rel, full string, ok bool) {
+	rel = safeRel(name)
 	if rel == "" {
-		httpErr(w, http.StatusBadRequest, "missing/invalid name")
-		return
+		return "", "", false
 	}
-	full := filepath.Join(incomingDir, filepath.FromSlash(rel))
+	full = filepath.Join(incomingDir, filepath.FromSlash(rel))
 	info, err := os.Stat(full)
-	if err != nil || info.IsDir() || isInternal(full) {
-		httpErr(w, http.StatusNotFound, "not found")
-		return
+	if err != nil || !info.Mode().IsRegular() || isInternal(full) {
+		return rel, full, false
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%q", path.Base(rel)))
+	return rel, full, true
+}
+
+// serveAttachment streams a file as a download. mime.FormatMediaType emits an
+// RFC 6266/2231 `filename*=` for non-ASCII names (a bare %q would put raw
+// UTF-8 into the header). nosniff: never let a browser reinterpret content.
+func serveAttachment(w http.ResponseWriter, r *http.Request, rel, full string) {
+	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": path.Base(rel)}))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeFile(w, r, full)
 }
 
-func handleDelete(w http.ResponseWriter, r *http.Request) {
-	rel := safeRel(r.URL.Query().Get("name"))
-	if rel == "" {
-		httpErr(w, http.StatusBadRequest, "missing/invalid name")
+func handleDownload(w http.ResponseWriter, r *http.Request) {
+	rel, full, ok := receivedFile(r.URL.Query().Get("name"))
+	if !ok {
+		httpErr(w, http.StatusNotFound, "not found")
 		return
 	}
-	full := filepath.Join(incomingDir, filepath.FromSlash(rel))
-	info, err := os.Stat(full)
-	if err != nil || info.IsDir() || isInternal(full) {
+	serveAttachment(w, r, rel, full)
+}
+
+func handleDelete(w http.ResponseWriter, r *http.Request) {
+	rel, full, ok := receivedFile(r.URL.Query().Get("name"))
+	if !ok {
 		httpErr(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -414,8 +438,21 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	pruneEmptyDirs(filepath.Dir(full))
 	log.Printf("deleted %s", rel)
 	writeJSON(w, map[string]any{"ok": true, "deleted": rel})
+}
+
+// pruneEmptyDirs removes now-empty folders left behind by a folder drop, walking
+// up from dir but never touching incomingDir itself. os.Remove refuses non-empty
+// directories, so the walk simply stops at the first one still in use.
+func pruneEmptyDirs(dir string) {
+	for dir != incomingDir && strings.HasPrefix(dir, incomingDir+string(filepath.Separator)) {
+		if os.Remove(dir) != nil {
+			return
+		}
+		dir = filepath.Dir(dir)
+	}
 }
 
 // notify fires a best-effort ntfy push when a file is received.
@@ -471,13 +508,18 @@ func remoteHost(r *http.Request) string {
 	return host
 }
 
+// isLoopback reports whether host (a bare IP) is a loopback address.
+func isLoopback(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func authTailnet(r *http.Request) bool {
 	if token != "" && authOK(r) {
 		return true // valid bearer token (peers / automation)
 	}
 	host := remoteHost(r)
-	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() &&
-		r.Header.Get("Tailscale-User-Login") != "" {
+	if isLoopback(host) && r.Header.Get("Tailscale-User-Login") != "" {
 		return true // authenticated tailnet user via local `tailscale serve`
 	}
 	return isTailnetIP(host) // direct connection from a tailnet CGNAT peer
@@ -509,22 +551,15 @@ func rawFilename(p *multipart.Part) string {
 }
 
 // safeRel cleans a client-supplied relative path: forward slashes, no leading
-// slash, no ".." escape, no empty. Returns "" if unsafe. Keeps subdirectories.
+// slash, no ".." escape, no empty, no NUL. Returns "" if unsafe. Keeps
+// subdirectories. Cleaning "/"+n resolves every ".." against the root, so the
+// result can never climb above incomingDir — no residual-segment scan needed.
 func safeRel(n string) string {
-	n = strings.TrimSpace(n)
-	n = strings.ReplaceAll(n, "\\", "/")
-	n = path.Clean("/" + n) // absolutize then clean → collapses .. that would escape
-	n = strings.TrimPrefix(n, "/")
-	if n == "" || n == "." || strings.HasPrefix(n, "../") || n == ".." {
-		return ""
+	if strings.IndexByte(n, 0) >= 0 {
+		return "" // NUL can't be a path byte; would only yield an opaque EINVAL later
 	}
-	// reject any residual traversal or absolute
-	for _, seg := range strings.Split(n, "/") {
-		if seg == ".." {
-			return ""
-		}
-	}
-	return n
+	n = strings.ReplaceAll(strings.TrimSpace(n), "\\", "/")
+	return strings.TrimPrefix(path.Clean("/"+n), "/") // "" when nothing is left
 }
 
 func uniquePath(p string) string {

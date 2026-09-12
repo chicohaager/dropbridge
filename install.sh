@@ -31,13 +31,15 @@ echo "-> DropBridge installer ($IMAGE)"
 # 1) shared bearer token as a file secret (0400, owned by container app user uid 1000)
 mkdir -p "$DEPLOY"
 if [ ! -f "$DEPLOY/secret.token" ]; then
-  umask 077
-  LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 48 > "$DEPLOY/secret.token"
-  chown "$UID_APP:$UID_APP" "$DEPLOY/secret.token" 2>/dev/null || true
+  # umask scoped to a subshell: it must not leak into the state/incoming mkdirs below
+  ( umask 077; LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 48 > "$DEPLOY/secret.token" )
   chmod 0400 "$DEPLOY/secret.token"
   echo "-> generated secret.token (48 chars). For a 2-node mesh, copy this SAME"
   echo "   file to $DEPLOY/secret.token on the other box."
 fi
+# The container user (uid 1000) must be able to READ the 0400 token — a silent
+# chown failure would start the app with ingest disabled ("no token").
+chown "$UID_APP:$UID_APP" "$DEPLOY/secret.token" || echo "!! WARN: chown secret.token failed — the app (uid $UID_APP) may not read it."
 
 # 2) node config (.env). Edit DROPBRIDGE_NODE / PEER_NAME / PEER_URL afterwards.
 if [ ! -f "$DEPLOY/.env" ]; then
@@ -76,9 +78,10 @@ $(awk '{print $1, $2, $3}' /proc/mounts)
 EOF
 fi
 
-# 4) fixed state dir + fallback incoming — both persistent
+# 4) fixed state dir + fallback incoming — both persistent, both writable by uid 1000
+#    (an unwritable state dir = peers/shares/storage choice silently not persisted)
 mkdir -p "$STATE" "$INCOMING"
-chown -R "$UID_APP:$UID_APP" "$STATE" "$INCOMING" 2>/dev/null || true
+chown -R "$UID_APP:$UID_APP" "$STATE" "$INCOMING" || echo "!! WARN: chown $STATE / $INCOMING failed — the app may not be able to write there."
 
 # 4b) preflight: the tailscaled LocalAPI socket must exist ON THE HOST. DropBridge
 #     needs it for tailnet identity + presence. If Tailscale runs as the ZimaOS
