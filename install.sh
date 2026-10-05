@@ -13,7 +13,7 @@
 # tile); it stays boot-safe via `restart: unless-stopped`.
 set -eu
 
-IMAGE="ghcr.io/chicohaager/dropbridge:0.2.0"
+IMAGE="ghcr.io/chicohaager/dropbridge:0.2.1"
 DEPLOY=/DATA/AppData/dropbridge/deploy      # persistent standalone deploy dir
 STATE=/DATA/AppData/dropbridge/state        # peers/shares/settings
 INCOMING=/DATA/dropbridge/incoming          # fallback received-files path

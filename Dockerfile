@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETOS TARGETARCH
 WORKDIR /src
 COPY go.mod ./
@@ -7,7 +7,7 @@ COPY *.go ./
 COPY static ./static
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -ldflags "-s -w" -o /dropbridge .
 
-FROM alpine:3.20
+FROM alpine:3.24
 RUN apk add --no-cache ca-certificates && adduser -D -u 1000 app
 COPY --from=build /dropbridge /usr/local/bin/dropbridge
 ENV DROPBRIDGE_INCOMING=/data/incoming \
